@@ -30,13 +30,17 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <coreauthd_spi.h>
+#include <pwd.h>
 #include <LocalAuthentication/LAPrivateDefines.h>
+#include <stdbool.h>
 
 #define PAM_SM_AUTH
 #define PAM_SM_ACCOUNT
 
 #include <security/pam_modules.h>
 #include <security/pam_appl.h>
+
+#define CONTINUITY_UNLOCK_PARAM "continuityunlock"
 
 PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
@@ -52,9 +56,29 @@ pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
     CFNumberRef key = NULL;
     CFNumberRef value = NULL;
     int tmp;
+    bool isContinuityUnlock = openpam_get_option(pamh, CONTINUITY_UNLOCK_PARAM) != NULL;
 
+    const char *user = NULL;
+    struct passwd *pwd = NULL;
+    struct passwd pwdbuf;
+    
+    /* determine the required bufsize for getpwnam_r */
+    int bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (bufsize == -1) {
+        bufsize = 2 * PATH_MAX;
+    }
+    
+    /* get information about user to authenticate for */
+    char *buffer = malloc(bufsize);
+    if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || !user ||
+        getpwnam_r(user, &pwdbuf, buffer, bufsize, &pwd) != 0 || !pwd) {
+        openpam_log(PAM_LOG_ERROR, "unable to obtain the username.");
+        retval = PAM_AUTHINFO_UNAVAIL;
+        goto cleanup;
+    }
+    
     /* get the externalized context */
-    tmpval = pam_get_data(pamh, "token", (void *)&externalized_context);
+    tmpval = pam_get_data(pamh, isContinuityUnlock ? "token_lacont" : "token_la", (void *)&externalized_context);
     if (tmpval != PAM_SUCCESS) {
         openpam_log(PAM_LOG_ERROR, "error obtaining the token: %d", tmpval);
         retval = PAM_AUTHINFO_UNAVAIL;
@@ -87,13 +111,21 @@ pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
     CFDictionarySetValue(options, key, value);
 
     /* evaluate policy */
-    if (!LAEvaluatePolicy(context, kLAPolicyDeviceOwnerAuthenticationWithBiometrics, options, &error)) {
-        openpam_log(PAM_LOG_ERROR, "policy evaluation failed: %ld", CFErrorGetCode(error));
+    int policy = isContinuityUnlock ? kLAPolicyContinuityUnlock : kLAPolicyDeviceOwnerAuthenticationWithBiometrics;
+    if (!LAEvaluatePolicy(context, policy, options, &error)) {
+        openpam_log(PAM_LOG_ERROR, "policy %d evaluation failed: %ld", policy, CFErrorGetCode(error));
         retval = PAM_AUTH_ERR;
         goto cleanup;
     }
 
-    /* we passed the Touch ID authentication successfully */
+    /* verify that M8 is not spoofed */
+    if (!LAVerifySEP(pwd->pw_uid, &error)) {
+        openpam_log(PAM_LOG_ERROR, "LAVerifySEP failed: %ld", CFErrorGetCode(error));
+        retval = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+    
+    /* we passed the authentication successfully */
     retval = PAM_SUCCESS;
     
 cleanup:
@@ -117,6 +149,9 @@ cleanup:
         CFRelease(error);
     }
 
+    if (buffer) {
+        free(buffer);
+    }
     openpam_log(PAM_LOG_NOTICE, "pam_localauthentication: pam_sm_authenticate returned %d", retval);
     return retval;
 }
