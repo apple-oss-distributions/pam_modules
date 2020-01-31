@@ -35,8 +35,10 @@
 #include <mach/mach_time.h>
 #include <membership.h>
 #include <membershipPriv.h>
+#include <ConfigurationProfiles/CPBootstrapToken.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <OpenDirectory/OpenDirectory.h>
+#include <OpenDirectory/OpenDirectoryPriv.h>
 #include <DirectoryService/DirectoryService.h>
 
 #define PAM_SM_AUTH
@@ -44,11 +46,6 @@
 
 #include <security/pam_modules.h>
 #include <security/pam_appl.h>
-
-/* legacy definition */
-#ifndef kDSValueAuthAuthorityDisabledUser
-#define kDSValueAuthAuthorityDisabledUser ";DisabledUser;"
-#endif
 
 #include "Common.h"
 
@@ -153,16 +150,13 @@ pam_sm_acct_mgmt(pam_handle_t * pamh, int flags, int argc, const char **argv)
 	}
 
 cleanup:
-	if (NULL != cfRecord) {
-		CFRelease(cfRecord);
-	}
+	CFReleaseSafe(cfRecord);
 	free(homedir);
 	pam_unsetenv(pamh, PAM_OD_PW_EXP);
 
 
 	return retval;
 }
-
 
 PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
@@ -171,6 +165,7 @@ pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
 	int retval = PAM_SUCCESS;
 	const char *user = NULL;
 	const char *password = NULL;
+	CFStringRef cfAuthAuthority = NULL;
 	CFStringRef cfPassword = NULL;
 	CFErrorRef odErr = NULL;
 	ODRecordRef cfRecord = NULL;
@@ -208,7 +203,28 @@ pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
 		goto cleanup;
 	}
 
-	/* verify the user's password */
+	/* <rdar://problem/48780154> Adopt new OD SPI and entitlement to use the bootstrap token prior to user authentication */
+	if (&CP_SupportsBootstrapToken != NULL) {
+		retval = od_record_attribute_create_cfstring(cfRecord, (CFStringRef) kODAttributeTypeAuthenticationAuthority, &cfAuthAuthority);
+		NSArray<NSString *> *authAttributes = nil;
+		if (retval == PAM_SUCCESS)
+			authAttributes = [(NSString *)cfAuthAuthority componentsSeparatedByString:@";"];
+		if ([authAttributes containsObject:@(kDSTagAuthAuthorityLocalCachedUser)] &&
+			CP_SupportsBootstrapToken()) {
+			/* Get token + authenticate. */
+			NSString *token = CP_GetBootstrapToken(NULL);
+			if (token != NULL && token.length > 0) {
+				if (ODRecordSetNodeCredentialsWithBootstrapToken(cfRecord, (CFStringRef) token, &odErr)) {
+					openpam_log(PAM_LOG_NOTICE, "%s - Authenticated with bootstrap token.", PM_DISPLAY_NAME);
+				} else {
+					openpam_log(PAM_LOG_ERROR, "%s - Failed to set bootstrap token: %s.", PM_DISPLAY_NAME, [(NSError *)odErr description].UTF8String);
+					CFReleaseNull(odErr);
+				}
+			}
+		}
+	}
+
+	/* Verify the user's password */
 	cfPassword = CFStringCreateWithCString(kCFAllocatorDefault, password, kCFStringEncodingUTF8);
 	retval = PAM_USER_UNKNOWN;
 	if (!ODRecordVerifyPassword(cfRecord, cfPassword, &odErr)) {
@@ -231,6 +247,14 @@ pam_sm_authenticate(pam_handle_t * pamh, int flags, int argc, const char **argv)
 			case kODErrorCredentialsInvalid:
 				openpam_log(PAM_LOG_DEBUG, "%s - The authtok is incorrect.", PM_DISPLAY_NAME);
 				retval = PAM_AUTH_ERR;
+				break;
+			case kODErrorCredentialsAccountTemporarilyLocked :
+				openpam_log(PAM_LOG_DEBUG, "%s - Account temporarily locked after incorrect password attempt(s).", PM_DISPLAY_NAME);
+				retval = PAM_APPLE_ACCT_TEMP_LOCK;
+				break;
+			case kODErrorCredentialsAccountLocked :
+				openpam_log(PAM_LOG_DEBUG, "%s - Account locked after too many incorrect password attempts.", PM_DISPLAY_NAME);
+				retval = PAM_APPLE_ACCT_LOCKED;
 				break;
 			default:
 				openpam_log(PAM_LOG_DEBUG, "%s  Unexpected error code from ODRecordVerifyPassword(): %ld.",
@@ -259,17 +283,10 @@ cleanup:
 		openpam_log(PAM_LOG_DEBUG, "%s - auth %lld µs (blinding)", PM_DISPLAY_NAME, microseconds);
 	}
 
-	if (NULL != cfRecord) {
-		CFRelease(cfRecord);
-	}
-
-	if (NULL != cfPassword) {
-		CFRelease(cfPassword);
-	}
-
-	if (NULL != odErr) {
-		CFRelease(odErr);
-	}
+	CFReleaseSafe(cfAuthAuthority);
+	CFReleaseSafe(cfRecord);
+	CFReleaseSafe(cfPassword);
+	CFReleaseSafe(odErr);
 
 	return retval;
 }
@@ -344,6 +361,14 @@ pam_sm_chauthtok(pam_handle_t * pamh, int flags, int argc, const char **argv)
 				openpam_log(PAM_LOG_DEBUG, "%s - The authtok us unrecoverable.", PM_DISPLAY_NAME);
 				retval = PAM_AUTHTOK_RECOVERY_ERR;
 				break;
+			case kODErrorCredentialsAccountTemporarilyLocked :
+				openpam_log(PAM_LOG_DEBUG, "%s - Account temporarily locked after incorrect password attempt(s).", PM_DISPLAY_NAME);
+				retval = PAM_APPLE_ACCT_TEMP_LOCK;
+				break;
+			case kODErrorCredentialsAccountLocked :
+				openpam_log(PAM_LOG_DEBUG, "%s - Account locked after too many incorrect password attempts.", PM_DISPLAY_NAME);
+				retval = PAM_APPLE_ACCT_LOCKED;
+				break;
 			default:
 				openpam_log(PAM_LOG_DEBUG, "%s - There was an unexpected error while changing the password.", PM_DISPLAY_NAME);
 				retval = PAM_ABORT;
@@ -354,21 +379,10 @@ pam_sm_chauthtok(pam_handle_t * pamh, int flags, int argc, const char **argv)
 	}
 
 cleanup:
-	if (NULL != odErr) {
-		CFRelease(odErr);
-	}
-
-	if (NULL != cfRecord) {
-		CFRelease(cfRecord);
-	}
-
-	if (NULL != cfOldPassword) {
-		CFRelease(cfOldPassword);
-	}
-
-	if (NULL != cfNewPassword) {
-		CFRelease(cfNewPassword);
-	}
+	CFReleaseSafe(odErr);
+	CFReleaseSafe(cfRecord);
+	CFReleaseSafe(cfOldPassword);
+	CFReleaseSafe(cfNewPassword);
 
 	return retval;
 }
