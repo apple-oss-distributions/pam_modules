@@ -51,6 +51,10 @@
 #include "scmatch_evaluation.h"
 #include "ds_ops.h"
 
+#if __has_feature(objc_arc)
+#   error "this file must be compiled without ARC"
+#endif
+
 #define CFReleaseSafe(CF) { CFTypeRef _cf = (CF); if (_cf) CFRelease(_cf); }
 #define PAM_OPT_PKINIT	"pkinit"
 
@@ -76,7 +80,6 @@ Boolean copy_smartcard_unlock_context(char *buffer, size_t buffsize, CFStringRef
 {
 	CFMutableDictionaryRef dict = NULL;
 	CFDataRef serializedData = NULL;
-	SecTransformRef encoder = NULL;
 	Boolean retval = FALSE;
 
 	if (token_id == NULL || pin == NULL || pub_key_hash == NULL || pub_key_hash_wrap == NULL)
@@ -94,27 +97,21 @@ Boolean copy_smartcard_unlock_context(char *buffer, size_t buffsize, CFStringRef
 	if (serializedData == NULL)
 		goto cleanup;
 
-	encoder = SecEncodeTransformCreate(kSecBase64Encoding, NULL);
-	if (encoder == NULL)
-		goto cleanup;
-	if (SecTransformSetAttribute(encoder, kSecTransformInputAttributeName, serializedData, NULL) == FALSE)
-		goto cleanup;
-
-	CFDataRef encodedData = SecTransformExecute(encoder, NULL);
-	if (encodedData) {
-		CFStringRef stringFromData = CFStringCreateWithBytes (kCFAllocatorDefault, CFDataGetBytePtr(encodedData), CFDataGetLength(encodedData), kCFStringEncodingUTF8, TRUE);
-		if (stringFromData) {
-			retval = CFStringGetCString(stringFromData, buffer, buffsize, kCFStringEncodingUTF8);
-			openpam_log(PAM_LOG_DEBUG, "Keychain unlock data %s", buffer);
-			CFRelease(stringFromData);
-		}
-		CFRelease(encodedData);
-	}
+    @autoreleasepool {
+        CFDataRef encodedData = (CFDataRef)[(NSData *)serializedData base64EncodedDataWithOptions:0];
+        if (encodedData) {
+            CFStringRef stringFromData = CFStringCreateWithBytes (kCFAllocatorDefault, CFDataGetBytePtr(encodedData), CFDataGetLength(encodedData), kCFStringEncodingUTF8, TRUE);
+            if (stringFromData) {
+                retval = CFStringGetCString(stringFromData, buffer, buffsize, kCFStringEncodingUTF8);
+                openpam_log(PAM_LOG_DEBUG, "Keychain unlock data %s", buffer);
+                CFRelease(stringFromData);
+            }
+        }
+    }
 
 cleanup:
 	CFReleaseSafe(dict);
 	CFReleaseSafe(serializedData);
-	CFReleaseSafe(encoder);
 
 	return retval;
 }
@@ -381,6 +378,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 				} else if (status == kTKErrorCodeAuthenticationFailed && keychain == NULL) {
 					// existing ahp_error is automatically released by pam_set_data when setting a new one
 					pam_set_data(pamh, "ahp_error", (void *)error, cleanup_func); // automatically releases previous object
+                    error = nil; // already transferred to ahp_error
 				} else {
 					CFReleaseSafe(error);
 					break; // do not retry on other errors than PIN failed
